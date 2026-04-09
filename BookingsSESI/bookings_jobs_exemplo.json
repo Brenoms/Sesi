@@ -1,0 +1,34 @@
+{
+  "jobs": [
+    {
+      "escolha_reserva": "1h40min",
+      "dias_semana": [
+        "Quarta"
+      ],
+      "equipe": [
+        "FABLAB CE109"
+      ],
+      "horario": "9:40",
+      "notas": "Aula recorrente criada via automação.",
+      "componente": "Outros",
+      "publico": "7EF",
+      "turmas": [
+        {
+          "turma": "A",
+          "dias_semana": ["Quarta"],
+          "horario": "9:40"
+        },
+        {
+          "turma": "B",
+          "dias_semana": ["Quinta"],
+          "horario": "10:00"
+        }
+      ],
+      "principal_recurso": "Outro Recurso",
+      "tipo_atividade": "Outro Tipo de Atividade",
+      "data_inicio": "08/04/2026",
+      "data_fim": "15/04/2026",
+      "confirmar_envio_real": true
+    }
+  ]
+}

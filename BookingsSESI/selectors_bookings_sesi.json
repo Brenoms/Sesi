@@ -1,0 +1,66 @@
+{
+  "generic": {
+    "after_submit_wait_ms": 3500,
+    "dropdown_option_candidates": [
+      "[role='option']",
+      "[role='listbox'] [role='option']",
+      ".ms-ComboBox-optionText",
+      ".ms-Dropdown-item",
+      "li",
+      "button",
+      "input[type='radio']",
+      "option"
+    ]
+  },
+  "popup_close_candidates": [
+    "button[aria-label='Fechar']",
+    "button[aria-label='Close']",
+    "button:has-text('Fechar')",
+    "button:has-text('Entendi')"
+  ],
+  "fields": {
+    "escolha_reserva_open": [],
+    "dia_semana_open": [],
+    "dia_semana_close_after_select": [],
+    "equipe_open": [
+      "button[aria-label*='membro da equipe']",
+      "button[role='presentation'][aria-haspopup='listbox']"
+    ],
+    "equipe_close_after_select": [],
+    "horario_open": [
+      "ul[role='list'] li"
+    ],
+    "notas_input": [
+      "textarea",
+      "[aria-label*='Notas']",
+      "[placeholder*='Notas']",
+      "[aria-label*='solicitaÃ§Ãµes especiais']"
+    ],
+    "publico_open": [
+      "select:nth-of-type(2)"
+    ],
+    "turma_open": [
+      "select:nth-of-type(3)"
+    ],
+    "principal_recurso_open": [
+      "select:nth-of-type(4)"
+    ],
+    "tipo_atividade_open": [
+      "select:nth-of-type(5)"
+    ],
+    "data_input": [
+      "div[aria-label='Selecione uma data.']"
+    ],
+    "botao_enviar": [
+      "button:has-text('Reservar')",
+      "button:has-text('Enviar')",
+      "[type='submit']"
+    ],
+    "novo_agendamento": [
+      "button:has-text('Novo agendamento')",
+      "button:has-text('Nova reserva')",
+      "a:has-text('Novo')"
+    ]
+  },
+  "field_values": {}
+}
