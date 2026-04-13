@@ -7,6 +7,10 @@ $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PayloadBuilder = Join-Path $ProjectRoot "build_exe_installer.ps1"
 $InstallerWorkDir = "BookingsSESI_InstallerBuild_" + [guid]::NewGuid().ToString("N")
 $PayloadZip = Join-Path (Join-Path $env:TEMP $InstallerWorkDir) "payload.zip"
+$PyInstallerPayloadDir = Join-Path $env:TEMP "BookingsSESI_InstallerBuild"
+$PyInstallerPayloadZip = Join-Path $PyInstallerPayloadDir "payload.zip"
+$PyInstallerWorkDir = Join-Path $env:TEMP ("BookingsSESI_PyInstaller_" + [guid]::NewGuid().ToString("N"))
+$PyInstallerDistDir = Join-Path $ProjectRoot "dist_gui"
 $VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $OutputDirFull = Join-Path $ProjectRoot $OutputDir
 
@@ -21,10 +25,14 @@ if (-not (Test-Path $PayloadZip)) {
 }
 
 New-Item -ItemType Directory -Path $OutputDirFull -Force | Out-Null
+New-Item -ItemType Directory -Path $PyInstallerPayloadDir -Force | Out-Null
+Copy-Item -LiteralPath $PayloadZip -Destination $PyInstallerPayloadZip -Force
+New-Item -ItemType Directory -Path $PyInstallerWorkDir -Force | Out-Null
+New-Item -ItemType Directory -Path $PyInstallerDistDir -Force | Out-Null
 
-& $VenvPython -m PyInstaller --clean --noconfirm (Join-Path $ProjectRoot "installer_gui.spec")
+& $VenvPython -m PyInstaller --noconfirm --distpath $PyInstallerDistDir --workpath $PyInstallerWorkDir (Join-Path $ProjectRoot "installer_gui.spec")
 
-$BuiltInstaller = Join-Path $ProjectRoot "dist\BookingsSESI-Instalador.exe"
+$BuiltInstaller = Join-Path $PyInstallerDistDir "BookingsSESI-Instalador.exe"
 if (-not (Test-Path $BuiltInstaller)) {
     throw "Instalador grafico nao encontrado em $BuiltInstaller"
 }

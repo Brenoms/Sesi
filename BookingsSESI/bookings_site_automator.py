@@ -63,8 +63,10 @@ import re
 import shutil
 import sys
 import time
+import calendar
 import datetime as dt
 import threading
+import unicodedata
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +88,15 @@ else:
 APP_NAME = "SESI Reservas Recorrentes"
 APP_SUBTITLE = "Agendamentos recorrentes com automação assistida"
 MAX_RECURRENCE_DAYS = 31
+
+FIELD_KEYWORDS: Dict[str, list[str]] = {
+    "equipe": ["equipe", "membro da equipe", "selecionar equipe", "team member"],
+    "componente": ["componente"],
+    "publico": ["publico", "público"],
+    "turma": ["turma"],
+    "principal_recurso": ["principal recurso", "recurso principal", "principal recurso"],
+    "tipo_atividade": ["tipo de atividade", "atividade"],
+}
 AUTH_DIR = BASE_DIR / "playwright_auth"
 AUTH_DIR.mkdir(exist_ok=True)
 STORAGE_STATE_PATH = AUTH_DIR / "storage_state.json"
@@ -207,12 +218,19 @@ def fail(msg: str) -> None:
         log_text_widget.see(tk.END)
         log_text_widget.config(state="disabled")
 
-def safe_add_result(msg: str, root: tk.Tk) -> None:
-    if results_text_widget:
-        root.after(0, lambda: results_text_widget.config(state="normal"))
-        root.after(0, lambda: results_text_widget.insert(tk.END, f"{msg}\n"))
-        root.after(0, lambda: results_text_widget.see(tk.END))
-        root.after(0, lambda: results_text_widget.config(state="disabled"))
+def safe_add_result(msg: str, root: Optional[tk.Tk], execution_mode: str = "real", outcome: str = "success") -> None:
+    if results_text_widget and root:
+        mode_key = "test" if execution_mode == "test" else "real"
+        outcome_key = "error" if outcome in {"error", "fail", "failed"} else "success"
+        tag_name = f"result_{mode_key}_{outcome_key}"
+
+        def _append() -> None:
+            results_text_widget.config(state="normal")
+            results_text_widget.insert(tk.END, f"{msg}\n", (tag_name,))
+            results_text_widget.see(tk.END)
+            results_text_widget.config(state="disabled")
+
+        root.after(0, _append)
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -248,14 +266,26 @@ def load_jobs(path: Path) -> List[BookingJob]:
 
 
 def parse_br_date(date_value: str) -> dt.date:
-    return dt.datetime.strptime(date_value, "%d/%m/%Y").date()
+    cleaned = _clean_option_text(date_value)
+    match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", cleaned)
+    if not match:
+        raise ValueError(f"Data inválida: '{date_value}'")
+    return dt.datetime.strptime(match.group(1), "%d/%m/%Y").date()
 
 
 def validate_recurrence_period(start_date: str, end_date: str) -> None:
     start = parse_br_date(start_date)
     end = parse_br_date(end_date)
+    today = dt.date.today()
+    max_end = today + dt.timedelta(days=MAX_RECURRENCE_DAYS)
+    if start < today:
+        raise ValueError(f"A data início não pode ser anterior à data atual ({today.strftime('%d/%m/%Y')}).")
+    if start > max_end:
+        raise ValueError(f"A data início não pode ultrapassar {max_end.strftime('%d/%m/%Y')}.")
     if end < start:
         raise ValueError("A data fim deve ser igual ou posterior à data início.")
+    if end > max_end:
+        raise ValueError(f"A data fim não pode ultrapassar {max_end.strftime('%d/%m/%Y')}.")
     if (end - start).days > MAX_RECURRENCE_DAYS:
         raise ValueError("A recorrência pode ter no máximo 1 mês entre a data início e a data fim.")
 
@@ -767,13 +797,14 @@ def fill_step_dia_semana(page: Page, job: BookingJob, cfg: Dict[str, Any]) -> No
 
 
 def fill_step_equipe(page: Page, job: BookingJob, cfg: Dict[str, Any]) -> None:
-    if not cfg["fields"]["equipe_open"]:
+    open_selectors = _get_or_autodetect_open_selectors(page, cfg, "equipe")
+    if not open_selectors:
         log("Pulando seleção de equipe (não disponível na página)")
         return
     log(f"Selecionando equipe: {job.equipe}")
     for pessoa in job.equipe:
         log(f"  Abrindo dropdown de equipe...")
-        click_any(page, cfg["fields"]["equipe_open"])
+        click_any(page, open_selectors)
         page.wait_for_timeout(1000)
         log(f"  Selecionando '{pessoa}'...")
         choose_option_from_open_dropdown(page, pessoa, cfg)
@@ -782,12 +813,16 @@ def fill_step_equipe(page: Page, job: BookingJob, cfg: Dict[str, Any]) -> None:
         click_any(page, cfg["fields"]["equipe_close_after_select"])
 
 
-def fill_step_horario(page: Page, job: BookingJob, cfg: Dict[str, Any]) -> None:
+def fill_step_horario(page: Page, job: BookingJob, cfg: Dict[str, Any], date_value: Optional[str] = None) -> None:
     log(f"Selecionando horário: {job.horario}")
     page.wait_for_timeout(2000)
     # Procurar no div do selecionador de horário
     log(f"  Aguardando que horários estejam disponíveis...")
-    page.wait_for_selector("div[role='group'] ul[role='list'] li label span", timeout=10000)
+    date_suffix = f" para a data {date_value}" if date_value else ""
+    try:
+        page.wait_for_selector("div[role='group'] ul[role='list'] li label span", timeout=10000)
+    except Exception as exc:
+        raise RuntimeError(f"Falha de HORÁRIO: os horários não ficaram disponíveis{date_suffix}.") from exc
     log(f"  Horários carregados, procurando por {job.horario}...")
     try:
         # Procurar por todos os spans de horário
@@ -828,7 +863,24 @@ def fill_step_horario(page: Page, job: BookingJob, cfg: Dict[str, Any]) -> None:
 
 def fill_step_notas(page: Page, job: BookingJob, cfg: Dict[str, Any]) -> None:
     log("Preenchendo notas")
-    fill_any(page, cfg["fields"]["notas_input"], job.notas)
+    note_selectors = list(cfg["fields"].get("notas_input", []) or [])
+    if note_selectors:
+        try:
+            fill_any(page, note_selectors, job.notas)
+            return
+        except Exception as exc:
+            warn(f"NÃ£o foi possÃ­vel preencher notas com os seletores padrÃ£o: {exc}")
+
+    if _fill_text_input_by_keywords(
+        page,
+        ["nota", "notas", "observacao", "observaÃ§Ã£o", "observacoes", "observaÃ§Ãµes"],
+        job.notas,
+    ):
+        return
+
+    raise RuntimeError(
+        "Campo de notas nÃ£o encontrado. Verifique se a unidade usa um rÃ³tulo diferente para esse campo."
+    )
 
 
 def fill_step_publico(page: Page, job: BookingJob, cfg: Dict[str, Any]) -> None:
@@ -840,6 +892,133 @@ def _clean_option_text(value: str) -> str:
     text = str(value or "").replace("\xa0", " ")
     text = re.sub(r"\s+", " ", text).strip(" \t\r\n,;")
     return text
+
+
+def _normalize_match_text(value: str) -> str:
+    text = _clean_option_text(value)
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = re.sub(r"[^0-9a-zA-Z]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def _describe_booking_failure(exc: Exception) -> tuple[str, str]:
+    message = _clean_option_text(str(exc)) or "Erro não identificado."
+    normalized = _normalize_match_text(message)
+    if "falha de horario" in normalized or "horario" in normalized:
+        return "HORÁRIO", message
+    if "falha de data" in normalized or "data" in normalized:
+        return "DATA", message
+    return "ERRO", message
+
+
+def _find_text_input_by_keywords(page: Page, keywords: list[str]):
+    keyword_set = {_normalize_match_text(keyword) for keyword in keywords if _normalize_match_text(keyword)}
+    if not keyword_set:
+        return None, ""
+
+    candidates = page.locator("textarea, input[type='text'], input:not([type]), input[type='search']")
+    try:
+        total_candidates = candidates.count()
+    except Exception:
+        return None, ""
+
+    best_locator = None
+    best_descriptor = ""
+    best_score = 0
+
+    for idx in range(total_candidates):
+        try:
+            control = candidates.nth(idx)
+            if not control.is_visible():
+                continue
+        except Exception:
+            continue
+
+        try:
+            is_disabled = control.get_attribute("disabled") is not None
+            aria_disabled = (control.get_attribute("aria-disabled") or "").strip().casefold() == "true"
+            readonly = control.get_attribute("readonly") is not None
+            input_type = (control.get_attribute("type") or "").strip().casefold()
+        except Exception:
+            continue
+
+        if is_disabled or aria_disabled or readonly:
+            continue
+        if input_type and input_type not in {"text", "search"}:
+            continue
+
+        descriptor_parts: list[str] = []
+
+        try:
+            control_id = (control.get_attribute("id") or "").strip()
+        except Exception:
+            control_id = ""
+
+        if control_id:
+            try:
+                label = page.locator(f"label[for='{control_id}']").first
+                if label.count() > 0:
+                    label_text = _clean_option_text(label.text_content() or "")
+                    if label_text:
+                        descriptor_parts.append(label_text)
+            except Exception:
+                pass
+
+        for attr_name in ("aria-label", "placeholder", "title", "name"):
+            try:
+                attr_value = _clean_option_text(control.get_attribute(attr_name) or "")
+            except Exception:
+                attr_value = ""
+            if attr_value:
+                descriptor_parts.append(attr_value)
+
+        descriptor = " | ".join(part for part in descriptor_parts if part)
+        normalized_descriptor = _normalize_match_text(descriptor)
+        if not normalized_descriptor:
+            continue
+
+        score = 0
+        for keyword in keyword_set:
+            if keyword in normalized_descriptor:
+                score += 20 + len(keyword)
+
+        if control_id and descriptor_parts:
+            score += 5
+
+        if score > best_score:
+            best_score = score
+            best_locator = control
+            best_descriptor = descriptor
+
+    return best_locator, best_descriptor
+
+
+def _fill_text_input_by_keywords(page: Page, keywords: list[str], value: str) -> bool:
+    locator, descriptor = _find_text_input_by_keywords(page, keywords)
+    if locator is None:
+        return False
+
+    descriptor_log = descriptor or ", ".join(keywords)
+    log(f"  [AUTO] Campo de texto identificado para notas: {descriptor_log}")
+
+    try:
+        locator.click()
+    except Exception:
+        pass
+
+    try:
+        locator.fill(value)
+    except Exception:
+        try:
+            locator.press("Control+A")
+            locator.press("Backspace")
+            locator.type(value)
+        except Exception:
+            return False
+
+    log("  [AUTO] Notas preenchidas com sucesso pelo rÃ³tulo do campo")
+    return True
 
 
 def _dedupe_option_values(values: list[str]) -> list[str]:
@@ -905,6 +1084,662 @@ def _collect_visible_texts(page: Page, selectors: list[str], limit_per_selector:
     return _dedupe_option_values(collected)
 
 
+def _find_first_visible_locator(page: Page, selectors: list[str], limit_per_selector: int = 20):
+    for sel in selectors:
+        try:
+            locator = page.locator(sel)
+            count = min(locator.count(), limit_per_selector)
+        except Exception:
+            continue
+        for idx in range(count):
+            try:
+                item = locator.nth(idx)
+                if item.is_visible():
+                    return item
+            except Exception:
+                continue
+    return None
+
+
+def _detect_control_selector(page: Page, keywords: list[str]) -> Optional[str]:
+    try:
+        candidates = page.evaluate(
+            """(keywords) => {
+                const norm = (value) => (value || "")
+                    .normalize("NFD")
+                    .replace(/[\\u0300-\\u036f]/g, "")
+                    .toLowerCase()
+                    .replace(/\\s+/g, " ")
+                    .trim();
+
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === "none" || style.visibility === "hidden") return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+
+                const cssEscape = (value) => {
+                    if (window.CSS && typeof window.CSS.escape === "function") {
+                        return window.CSS.escape(value);
+                    }
+                    return String(value).replace(/([ #;?%&,.+*~\\':"!^$\\[\\]()=>|\\/])/g, "\\\\$1");
+                };
+
+                const cssPath = (el) => {
+                    if (!el || el.nodeType !== Node.ELEMENT_NODE) return "";
+                    if (el.id) return `#${cssEscape(el.id)}`;
+                    const parts = [];
+                    let current = el;
+                    while (current && current.nodeType === Node.ELEMENT_NODE && current !== document.body) {
+                        let selector = current.tagName.toLowerCase();
+                        const role = current.getAttribute("role");
+                        const ariaLabel = current.getAttribute("aria-label");
+                        const name = current.getAttribute("name");
+                        if (role) {
+                            selector += `[role="${role.replace(/"/g, '\\"')}"]`;
+                        } else if (ariaLabel) {
+                            selector += `[aria-label="${ariaLabel.replace(/"/g, '\\"')}"]`;
+                        } else if (name) {
+                            selector += `[name="${name.replace(/"/g, '\\"')}"]`;
+                        }
+                        let index = 1;
+                        let sibling = current;
+                        while ((sibling = sibling.previousElementSibling)) {
+                            if (sibling.tagName === current.tagName) index += 1;
+                        }
+                        selector += `:nth-of-type(${index})`;
+                        parts.unshift(selector);
+                        const path = parts.join(" > ");
+                        try {
+                            if (document.querySelectorAll(path).length === 1) return path;
+                        } catch (error) {}
+                        current = current.parentElement;
+                    }
+                    return parts.join(" > ");
+                };
+
+                const uniquePush = (target, value) => {
+                    const cleaned = (value || "").trim();
+                    if (cleaned && !target.includes(cleaned)) {
+                        target.push(cleaned);
+                    }
+                };
+
+                const describeControl = (control) => {
+                    const texts = [];
+                    uniquePush(texts, control.getAttribute("aria-label"));
+                    uniquePush(texts, control.getAttribute("title"));
+                    uniquePush(texts, control.getAttribute("placeholder"));
+                    uniquePush(texts, control.innerText);
+
+                    const labelledBy = (control.getAttribute("aria-labelledby") || "").split(/\\s+/).filter(Boolean);
+                    for (const labelId of labelledBy) {
+                        const labelEl = document.getElementById(labelId);
+                        if (labelEl) uniquePush(texts, labelEl.innerText || labelEl.textContent || "");
+                    }
+
+                    if (control.id) {
+                        const labelEl = document.querySelector(`label[for="${cssEscape(control.id)}"]`);
+                        if (labelEl) uniquePush(texts, labelEl.innerText || labelEl.textContent || "");
+                    }
+
+                    const controlRect = control.getBoundingClientRect();
+                    let ancestor = control.parentElement;
+                    for (let depth = 0; ancestor && depth < 4; depth += 1, ancestor = ancestor.parentElement) {
+                        const nearby = ancestor.querySelectorAll("label, legend, span, div, strong, p");
+                        for (const node of nearby) {
+                            if (node === control || node.contains(control) || !visible(node)) continue;
+                            const nodeText = (node.innerText || node.textContent || "").trim();
+                            if (!nodeText || nodeText.length > 120) continue;
+                            const nodeRect = node.getBoundingClientRect();
+                            const verticalDistance = Math.abs(controlRect.top - nodeRect.bottom);
+                            const horizontalOverlap = nodeRect.right >= controlRect.left - 80 && nodeRect.left <= controlRect.right + 80;
+                            if (verticalDistance <= 100 && horizontalOverlap) {
+                                uniquePush(texts, nodeText);
+                            }
+                        }
+                    }
+
+                    return texts.join(" | ");
+                };
+
+                const targetKeywords = (keywords || []).map(norm).filter(Boolean);
+                const controls = Array.from(document.querySelectorAll("select, button, [role='combobox'], [aria-haspopup='listbox'], input[role='combobox']"));
+                const matches = [];
+
+                for (const control of controls) {
+                    const descriptor = describeControl(control);
+                    const haystack = norm(descriptor);
+                    if (!haystack) continue;
+
+                    let score = 0;
+                    for (const keyword of targetKeywords) {
+                        if (haystack.includes(keyword)) {
+                            score += 10 + keyword.length;
+                        }
+                    }
+                    if (!score) continue;
+
+                    const selector = cssPath(control);
+                    if (!selector) continue;
+
+                    const isVisible = visible(control);
+                    if (!isVisible && control.tagName.toLowerCase() !== "select") continue;
+                    matches.push({ selector, descriptor, score, visible: isVisible });
+                }
+
+                matches.sort((a, b) => b.score - a.score || (b.visible === a.visible ? a.selector.length - b.selector.length : (b.visible ? 1 : -1)));
+                return matches.slice(0, 5);
+            }""",
+            keywords,
+        )
+    except Exception:
+        return None
+
+    if not candidates:
+        return None
+    return str(candidates[0].get("selector") or "").strip() or None
+
+
+def _extract_visible_texts_near_control(page: Page, control_selector: str) -> list[str]:
+    try:
+        values = page.evaluate(
+            """(selector) => {
+                const control = document.querySelector(selector);
+                if (!control) return [];
+
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === "none" || style.visibility === "hidden") return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+
+                const isLeafLike = (el, text) => {
+                    const children = Array.from(el.children || []);
+                    return !children.some((child) => ((child.innerText || child.textContent || "").trim() === text));
+                };
+
+                const rect = control.getBoundingClientRect();
+                const results = [];
+                const nodes = Array.from(document.querySelectorAll("li, [role='option'], button, div, span, label"));
+
+                for (const node of nodes) {
+                    if (!visible(node)) continue;
+                    const text = (node.innerText || node.textContent || "").trim();
+                    if (!text || text.length > 180) continue;
+                    if (!isLeafLike(node, text)) continue;
+
+                    const nodeRect = node.getBoundingClientRect();
+                    const horizontalMatch = nodeRect.right >= rect.left - 80 && nodeRect.left <= rect.right + 420;
+                    const verticalMatch = nodeRect.top >= rect.top - 60 && nodeRect.top <= rect.bottom + 720;
+                    if (!horizontalMatch || !verticalMatch) continue;
+                    if (nodeRect.width < 10 || nodeRect.height < 10) continue;
+                    results.push(text);
+                }
+
+                return results;
+            }""",
+            control_selector,
+        )
+    except Exception:
+        return []
+    return [str(value) for value in (values or []) if str(value).strip()]
+
+
+def _get_field_key_from_label_keyword(label_keyword: str) -> Optional[str]:
+    normalized = _normalize_match_text(label_keyword)
+    for field_key, keywords in FIELD_KEYWORDS.items():
+        if any(_normalize_match_text(keyword) in normalized or normalized in _normalize_match_text(keyword) for keyword in keywords):
+            return field_key
+    return None
+
+
+def _filter_imported_field_values(field_key: str, raw_values: list[str]) -> list[str]:
+    keywords = {_normalize_match_text(keyword) for keyword in FIELD_KEYWORDS.get(field_key, [field_key])}
+    all_field_keywords = {
+        _normalize_match_text(keyword)
+        for keyword_list in FIELD_KEYWORDS.values()
+        for keyword in keyword_list
+    }
+    all_field_keywords.update({
+        "nota",
+        "notas",
+        "dia da semana",
+        "horario",
+        "adicionar seus detalhes",
+        "fornecer informacoes adicionais",
+    })
+
+    filtered: list[str] = []
+    for value in raw_values:
+        cleaned = _clean_option_text(value)
+        normalized = _normalize_match_text(cleaned)
+        if not cleaned:
+            continue
+        if cleaned.endswith(":"):
+            continue
+        if normalized in {"selecione uma opcao", "selecione", "selecionar", "selecionar opcao"}:
+            continue
+        if normalized in keywords:
+            continue
+        if normalized in all_field_keywords:
+            continue
+        if field_key == "equipe" and _is_invalid_equipe_value(cleaned):
+            continue
+        if field_key != "horario" and _is_time_option_text(cleaned):
+            continue
+        if field_key != "escolha_reserva" and _is_reservation_option_text(cleaned):
+            continue
+        if field_key != "horario" and not any(char.isalpha() for char in cleaned):
+            continue
+        filtered.append(cleaned)
+    return _dedupe_option_values(filtered)
+
+
+def _detect_select_selector(page: Page, keywords: list[str]) -> Optional[str]:
+    try:
+        candidates = page.evaluate(
+            """(keywords) => {
+                const norm = (value) => (value || "")
+                    .normalize("NFD")
+                    .replace(/[\\u0300-\\u036f]/g, "")
+                    .toLowerCase()
+                    .replace(/\\s+/g, " ")
+                    .trim();
+
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === "none" || style.visibility === "hidden") return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+
+                const cssEscape = (value) => {
+                    if (window.CSS && typeof window.CSS.escape === "function") {
+                        return window.CSS.escape(value);
+                    }
+                    return String(value).replace(/([ #;?%&,.+*~\\':"!^$\\[\\]()=>|\\/])/g, "\\\\$1");
+                };
+
+                const cssPath = (el) => {
+                    if (!el || el.nodeType !== Node.ELEMENT_NODE) return "";
+                    if (el.id) return `#${cssEscape(el.id)}`;
+                    const parts = [];
+                    let current = el;
+                    while (current && current.nodeType === Node.ELEMENT_NODE && current !== document.body) {
+                        let selector = current.tagName.toLowerCase();
+                        let index = 1;
+                        let sibling = current;
+                        while ((sibling = sibling.previousElementSibling)) {
+                            if (sibling.tagName === current.tagName) index += 1;
+                        }
+                        selector += `:nth-of-type(${index})`;
+                        parts.unshift(selector);
+                        const path = parts.join(" > ");
+                        try {
+                            if (document.querySelectorAll(path).length === 1) return path;
+                        } catch (error) {}
+                        current = current.parentElement;
+                    }
+                    return parts.join(" > ");
+                };
+
+                const uniquePush = (target, value) => {
+                    const cleaned = (value || "").trim();
+                    if (cleaned && !target.includes(cleaned)) {
+                        target.push(cleaned);
+                    }
+                };
+
+                const describeSelect = (select) => {
+                    const texts = [];
+                    uniquePush(texts, select.getAttribute("aria-label"));
+                    uniquePush(texts, select.getAttribute("title"));
+                    if (select.id) {
+                        const labelEl = document.querySelector(`label[for="${cssEscape(select.id)}"]`);
+                        if (labelEl) uniquePush(texts, labelEl.innerText || labelEl.textContent || "");
+                    }
+                    const rect = select.getBoundingClientRect();
+                    let ancestor = select.parentElement;
+                    for (let depth = 0; ancestor && depth < 4; depth += 1, ancestor = ancestor.parentElement) {
+                        const nearby = ancestor.querySelectorAll("label, legend, span, div, strong, p, h3");
+                        for (const node of nearby) {
+                            if (node === select || node.contains(select) || !visible(node)) continue;
+                            const text = (node.innerText || node.textContent || "").trim();
+                            if (!text || text.length > 120) continue;
+                            const nodeRect = node.getBoundingClientRect();
+                            const verticalDistance = Math.abs(rect.top - nodeRect.bottom);
+                            const horizontalOverlap = nodeRect.right >= rect.left - 120 && nodeRect.left <= rect.right + 120;
+                            if (verticalDistance <= 120 && horizontalOverlap) {
+                                uniquePush(texts, text);
+                            }
+                        }
+                    }
+                    return texts.join(" | ");
+                };
+
+                const targetKeywords = (keywords || []).map(norm).filter(Boolean);
+                const selects = Array.from(document.querySelectorAll("select"));
+                const matches = [];
+
+                for (const select of selects) {
+                    if (!visible(select)) continue;
+                    const descriptor = describeSelect(select);
+                    const haystack = norm(descriptor);
+                    if (!haystack) continue;
+
+                    let score = 0;
+                    for (const keyword of targetKeywords) {
+                        if (haystack.includes(keyword)) score += 10 + keyword.length;
+                    }
+                    if (!score) continue;
+
+                    const selector = cssPath(select);
+                    if (!selector) continue;
+                    matches.push({ selector, score, descriptor });
+                }
+
+                matches.sort((a, b) => b.score - a.score || a.selector.length - b.selector.length);
+                return matches.slice(0, 5);
+            }""",
+            keywords,
+        )
+    except Exception:
+        return None
+
+    if not candidates:
+        return None
+    return str(candidates[0].get("selector") or "").strip() or None
+
+
+def _get_select_locator_by_label(page: Page, label_keyword: str):
+    field_key = _get_field_key_from_label_keyword(label_keyword)
+    keywords = FIELD_KEYWORDS.get(field_key, [label_keyword])
+
+    select_elements = page.locator("select")
+    total_selects = select_elements.count()
+    best_exact = None
+    best_contains = None
+    for idx in range(total_selects):
+        try:
+            select = select_elements.nth(idx)
+            select_id = select.get_attribute("id")
+            if select_id:
+                label = page.locator(f"label[for='{select_id}']")
+                if label.count() > 0:
+                    label_text = _normalize_match_text(label.text_content() or "")
+                    for keyword in keywords:
+                        normalized_keyword = _normalize_match_text(keyword)
+                        if not normalized_keyword:
+                            continue
+                        if label_text == normalized_keyword:
+                            best_exact = select
+                            break
+                        if normalized_keyword in label_text and best_contains is None:
+                            best_contains = select
+                    if best_exact is not None:
+                        return best_exact
+            aria_label = _normalize_match_text(select.get_attribute("aria-label") or "")
+            for keyword in keywords:
+                normalized_keyword = _normalize_match_text(keyword)
+                if not normalized_keyword:
+                    continue
+                if aria_label == normalized_keyword:
+                    return select
+                if normalized_keyword in aria_label and best_contains is None:
+                    best_contains = select
+        except Exception:
+            continue
+    if best_contains is not None:
+        return best_contains
+
+    selector = _detect_select_selector(page, keywords)
+    if selector:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0:
+                return locator
+        except Exception:
+            pass
+    return None
+
+
+def _get_or_autodetect_open_selectors(page: Page, selectors_cfg: Dict[str, Any], field_key: str) -> list[str]:
+    cfg_key = f"{field_key}_open"
+    fields_cfg = selectors_cfg.setdefault("fields", {})
+    existing = list(fields_cfg.get(cfg_key, []) or [])
+    if existing:
+        try:
+            wait_for_any_selector(page, existing, timeout=1500)
+            return existing
+        except Exception:
+            pass
+
+    auto_selector = _detect_control_selector(page, FIELD_KEYWORDS.get(field_key, [field_key]))
+    if auto_selector:
+        fields_cfg[cfg_key] = [auto_selector]
+        log(f"  [AUTO] Seletor calibrado para '{field_key}': {auto_selector}")
+        return [auto_selector]
+    return []
+
+
+def _is_time_option_text(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,2}:\d{2}", _clean_option_text(value)))
+
+
+def _is_reservation_option_text(value: str) -> bool:
+    cleaned = _clean_option_text(value)
+    lowered = cleaned.casefold()
+    if re.fullmatch(r"\d+h\d+min|\d+min", cleaned, flags=re.IGNORECASE):
+        return True
+    return "reserva" in lowered or "minutos" in lowered
+
+
+def _is_placeholder_equipe_value(value: str) -> bool:
+    normalized = _normalize_match_text(value)
+    return normalized in {
+        "alguem",
+        "selecionar equipe",
+        "selecionar equipe opcional",
+        "selecione equipe",
+        "selecione equipe opcional",
+    }
+
+
+def _is_invalid_equipe_value(value: str) -> bool:
+    normalized = _normalize_match_text(value)
+    if not normalized:
+        return True
+    if _is_placeholder_equipe_value(value):
+        return True
+    if normalized in {
+        "nota",
+        "notas",
+        "publico",
+        "turma",
+        "componente",
+        "principal recurso",
+        "tipo de atividade",
+        "adicionar seus detalhes",
+        "fornecer informacoes adicionais",
+        "nao",
+        "sim",
+        "dstqqss",
+    }:
+        return True
+    if re.fullmatch(r"(janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+\d{4}", normalized):
+        return True
+    if normalized.startswith("todos os horarios estao em"):
+        return True
+    if normalized.startswith("adicionar seus detalhes"):
+        return True
+    if normalized.startswith("fornecer informacoes adicionais"):
+        return True
+    if normalized.startswith("selecione uma opcao"):
+        return True
+    return False
+
+
+def _extract_equipe_name_from_block(value: str) -> str:
+    cleaned = _clean_option_text(value)
+    if not cleaned:
+        return ""
+
+    parts = [part.strip(" -:") for part in re.split(r"[\r\n]+", str(value or "")) if part.strip()]
+    for part in parts:
+        normalized = _clean_option_text(part)
+        lowered = normalized.casefold()
+        if not normalized:
+            continue
+        if lowered.startswith("selecionar equipe"):
+            continue
+        if "dispon" in lowered:
+            continue
+        if _is_invalid_equipe_value(normalized):
+            continue
+        if _is_time_option_text(normalized) or _is_reservation_option_text(normalized):
+            continue
+        if any(char.isalpha() for char in normalized):
+            return normalized
+
+    stripped_status = re.split(r"\bdispon[ií]vel\b|\bindispon[ií]vel\b", cleaned, flags=re.IGNORECASE)[0].strip(" -:")
+    if stripped_status and any(char.isalpha() for char in stripped_status):
+        if _is_invalid_equipe_value(stripped_status):
+            return ""
+        if not _is_time_option_text(stripped_status) and not _is_reservation_option_text(stripped_status):
+            return stripped_status
+    return ""
+
+
+def _extract_equipe_options_from_page_blocks(page: Page, trigger=None) -> list[str]:
+    collected: list[str] = []
+
+    if trigger is not None:
+        try:
+            trigger_text = trigger.inner_text(timeout=1000)
+        except Exception:
+            trigger_text = ""
+        trigger_name = _extract_equipe_name_from_block(trigger_text)
+        if trigger_name:
+            collected.append(trigger_name)
+
+    try:
+        blocks = page.evaluate(
+            """() => {
+                const results = [];
+                const elements = Array.from(document.querySelectorAll('li, [role="option"], button, div'));
+                for (const el of elements) {
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 1 || rect.height < 1) continue;
+                    const text = (el.innerText || '').trim();
+                    if (!text) continue;
+                    if (text.length > 180) continue;
+                    if (!/dispon[ií]vel|indispon[ií]vel/i.test(text)) continue;
+                    results.push(text);
+                }
+                return results;
+            }"""
+        )
+    except Exception:
+        blocks = []
+
+    for block in blocks or []:
+        name = _extract_equipe_name_from_block(block)
+        if name:
+            collected.append(name)
+
+    return _dedupe_option_values(collected)
+
+
+def _extract_custom_field_options(page: Page, field_key: str, selectors_cfg: Dict[str, Any]) -> list[str]:
+    open_selectors = _get_or_autodetect_open_selectors(page, selectors_cfg, field_key)
+    if not open_selectors:
+        return []
+
+    trigger = _find_first_visible_locator(page, open_selectors)
+    if trigger is not None:
+        try:
+            trigger.click()
+        except Exception:
+            click_any(page, open_selectors)
+    else:
+        click_any(page, open_selectors)
+    page.wait_for_timeout(1000)
+
+    selector_for_scan = open_selectors[0]
+    raw_texts = _extract_visible_texts_near_control(page, selector_for_scan)
+
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(250)
+    except Exception:
+        pass
+
+    if field_key == "equipe":
+        names: list[str] = []
+        for value in raw_texts:
+            for part in re.split(r"[\r\n]+", value):
+                name = _extract_equipe_name_from_block(part)
+                if name:
+                    names.append(name)
+        if trigger is not None:
+            try:
+                trigger_name = _extract_equipe_name_from_block(trigger.inner_text(timeout=1000))
+            except Exception:
+                trigger_name = ""
+            if trigger_name:
+                names.insert(0, trigger_name)
+        return [value for value in _dedupe_option_values(names) if not _is_invalid_equipe_value(value)]
+
+    keywords = {_normalize_match_text(keyword) for keyword in FIELD_KEYWORDS.get(field_key, [field_key])}
+    all_field_keywords = {
+        _normalize_match_text(keyword)
+        for keyword_list in FIELD_KEYWORDS.values()
+        for keyword in keyword_list
+    }
+    all_field_keywords.update({
+        "nota",
+        "notas",
+        "publico",
+        "turma",
+        "componente",
+        "principal recurso",
+        "tipo de atividade",
+        "equipe",
+        "horario",
+        "dia da semana",
+    })
+    cleaned_values: list[str] = []
+    for value in raw_texts:
+        for part in re.split(r"[\r\n]+", value):
+            cleaned = _clean_option_text(part)
+            normalized = _normalize_match_text(cleaned)
+            if not cleaned:
+                continue
+            if cleaned.endswith(":"):
+                continue
+            if "disponivel" in normalized or "indisponivel" in normalized:
+                continue
+            if normalized in keywords:
+                continue
+            if normalized in all_field_keywords:
+                continue
+            if "selecione" in normalized or "selecionar" in normalized:
+                continue
+            if _is_time_option_text(cleaned) or _is_reservation_option_text(cleaned):
+                continue
+            if any(char.isalpha() for char in cleaned):
+                cleaned_values.append(cleaned)
+    return _dedupe_option_values(cleaned_values)
+
+
 def _click_first_matching_visible_option(page: Page, option_text: str, selectors: list[str]) -> bool:
     target = _clean_option_text(option_text)
     if not target:
@@ -937,6 +1772,37 @@ def _click_first_matching_visible_option(page: Page, option_text: str, selectors
 
 
 def _extract_reservation_options(page: Page) -> list[str]:
+    service_names: list[str] = []
+    radio_selectors = [
+        "input[name='selectedService'][role='radio']",
+        "li input[name='selectedService']",
+        "ul[role='list'] input[name='selectedService']",
+    ]
+    for sel in radio_selectors:
+        try:
+            locator = page.locator(sel)
+            count = min(locator.count(), 30)
+        except Exception:
+            continue
+        for idx in range(count):
+            try:
+                item = locator.nth(idx)
+                label = _clean_option_text(item.get_attribute("aria-label") or "")
+                if label:
+                    service_names.append(label)
+                    continue
+                item_id = item.get_attribute("id") or ""
+                if item_id:
+                    label_locator = page.locator(f"label[for='{item_id}'] .TJKeI, label[for='{item_id}'] span").first
+                    text = _clean_option_text(label_locator.text_content(timeout=1000) or "")
+                    if text:
+                        service_names.append(text)
+            except Exception:
+                continue
+    service_names = _dedupe_option_values(service_names)
+    if service_names:
+        return service_names
+
     source_texts: list[str] = []
     try:
         source_texts.append(page.locator("body").inner_text(timeout=3000))
@@ -946,19 +1812,192 @@ def _extract_reservation_options(page: Page) -> list[str]:
 
     matches: list[str] = []
     for text in source_texts:
+        for hours, minutes in re.findall(r"(\d+)\s*hora[s]?\s*(\d+)\s*minuto[s]?", str(text), flags=re.IGNORECASE):
+            matches.append(f"{int(hours)}h{int(minutes):02d}min")
+        for minutes in re.findall(r"\b(\d+)\s*minuto[s]?\b", str(text), flags=re.IGNORECASE):
+            matches.append(f"{int(minutes)}min")
         matches.extend(re.findall(r"\b\d+h\d+min\b|\b\d+min\b", str(text), flags=re.IGNORECASE))
     return _dedupe_option_values(matches)
+
+
+def _select_reference_service(page: Page, service_name: str) -> bool:
+    target = _normalize_match_text(service_name)
+    if not target:
+        return False
+
+    selectors = [
+        "input[name='selectedService'][role='radio']",
+        "input[name='selectedService']",
+        "ul[role='list'] li",
+    ]
+    for sel in selectors:
+        try:
+            locator = page.locator(sel)
+            count = min(locator.count(), 30)
+        except Exception:
+            continue
+        for idx in range(count):
+            try:
+                item = locator.nth(idx)
+                raw_text = _clean_option_text(
+                    item.get_attribute("aria-label")
+                    or item.text_content(timeout=1000)
+                    or item.inner_text(timeout=1000)
+                    or ""
+                )
+            except Exception:
+                continue
+            if _normalize_match_text(raw_text) != target:
+                continue
+            try:
+                item_id = item.get_attribute("id") or ""
+            except Exception:
+                item_id = ""
+            try:
+                if item_id:
+                    label = page.locator(f"label[for='{item_id}']").first
+                    if label.count() > 0:
+                        label.click()
+                        return True
+            except Exception:
+                pass
+            try:
+                item.click(force=True)
+                return True
+            except Exception:
+                continue
+    return _click_first_matching_visible_option(
+        page,
+        service_name,
+        ["input[name='selectedService']", "label", "li", "button", "span", "div"],
+    )
+
+
+def _find_first_available_date_value(page: Page) -> str:
+    try:
+        value = page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+
+                const nodes = Array.from(document.querySelectorAll('div[data-value]'));
+                for (const el of nodes) {
+                    if (!visible(el)) continue;
+                    const dataValue = el.getAttribute('data-value') || '';
+                    const ariaDisabled = (el.getAttribute('aria-disabled') || '').toLowerCase();
+                    const cls = String(el.className || '').toLowerCase();
+                    const text = (el.innerText || '').trim();
+                    if (!dataValue || !text) continue;
+                    if (ariaDisabled === 'true') continue;
+                    if (cls.includes('disabled') || cls.includes('unavailable')) continue;
+                    if (!/^\\d{1,2}$/.test(text)) continue;
+                    return dataValue;
+                }
+                return '';
+            }"""
+        )
+    except Exception:
+        value = ""
+    return _clean_option_text(value)
+
+
+def _select_reference_date(page: Page) -> Optional[str]:
+    date_value = _find_first_available_date_value(page)
+    if not date_value:
+        return None
+    try:
+        click_any(page, [f"div[data-value='{date_value}']"])
+        page.wait_for_timeout(1200)
+        return date_value
+    except Exception:
+        return None
+
+
+def _select_reference_date_with_retry(page: Page, attempts: int = 3) -> Optional[str]:
+    for attempt in range(1, attempts + 1):
+        date_value = _select_reference_date(page)
+        if date_value:
+            return date_value
+        page.wait_for_timeout(1200)
+        log(f"  [RETRY] Tentativa {attempt}/{attempts} sem data disponível ainda.")
+    return None
+
+
+def _select_reference_time(page: Page, time_value: str) -> bool:
+    target = _clean_option_text(time_value)
+    if not target:
+        return False
+    time_selectors = [
+        "div[role='group'] ul[role='list'] li label span",
+        "div[role='group'] ul[role='list'] li label",
+        "div[role='group'] ul[role='list'] li button",
+        "div[role='group'] ul[role='list'] li",
+        "ul[role='list'] li label span",
+        "ul[role='list'] li label",
+        "ul[role='list'] li button",
+        "ul[role='list'] li",
+        "ul[role='list'] li span",
+    ]
+    return _click_first_matching_visible_option(page, target, time_selectors)
 
 
 def _extract_time_options(page: Page) -> list[str]:
     time_selectors = [
         "div[role='group'] ul[role='list'] li label span",
+        "div[role='group'] ul[role='list'] li label",
+        "div[role='group'] ul[role='list'] li button",
+        "div[role='group'] ul[role='list'] li",
         "ul[role='list'] li label span",
+        "ul[role='list'] li label",
+        "ul[role='list'] li button",
+        "ul[role='list'] li",
         "ul[role='list'] li span",
     ]
     candidates = _collect_visible_texts(page, time_selectors, limit_per_selector=240)
     times = [value for value in candidates if re.fullmatch(r"\d{1,2}:\d{2}", value)]
     return _dedupe_option_values(times)
+
+
+def _extract_time_options_with_retry(page: Page, attempts: int = 4) -> list[str]:
+    for attempt in range(1, attempts + 1):
+        time_options = _extract_time_options(page)
+        if time_options:
+            return time_options
+        page.wait_for_timeout(1200)
+        log(f"  [RETRY] Tentativa {attempt}/{attempts} sem horários visíveis ainda.")
+    return []
+
+
+def _wait_for_booking_details_form(page: Page, attempts: int = 5) -> bool:
+    for attempt in range(1, attempts + 1):
+        try:
+            if page.locator("select").count() > 0:
+                return True
+        except Exception:
+            pass
+        try:
+            if page.locator("textarea, input[type='text'], input:not([type])").count() > 0:
+                return True
+        except Exception:
+            pass
+        try:
+            if page.get_by_text("Adicionar seus detalhes", exact=False).count() > 0:
+                return True
+        except Exception:
+            pass
+        try:
+            if page.get_by_text("Fornecer informações adicionais", exact=False).count() > 0:
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(1200)
+        log(f"  [RETRY] Tentativa {attempt}/{attempts} aguardando formulário adicional.")
+    return False
 
 
 def _merge_horario_options(existing: list[str], imported: list[str]) -> list[str]:
@@ -975,17 +2014,50 @@ def _merge_horario_options(existing: list[str], imported: list[str]) -> list[str
 
 
 def _extract_equipe_options(page: Page, selectors_cfg: Dict[str, Any]) -> list[str]:
-    open_selectors = selectors_cfg.get("fields", {}).get("equipe_open", [])
+    open_selectors = _get_or_autodetect_open_selectors(page, selectors_cfg, "equipe")
     if not open_selectors:
         return []
-    option_selectors = list(selectors_cfg.get("generic", {}).get("dropdown_option_candidates", []))
-    option_selectors.extend([
-        "[role='listbox'] [role='option']",
-        "[role='option']",
-        "li",
-    ])
-    click_any(page, open_selectors)
+
+    trigger = _find_first_visible_locator(page, open_selectors)
+    if trigger is not None:
+        try:
+            trigger.click()
+        except Exception:
+            click_any(page, open_selectors)
+    else:
+        click_any(page, open_selectors)
     page.wait_for_timeout(1200)
+
+    scoped_selectors: list[str] = []
+    if trigger is not None:
+        try:
+            raw_controls = " ".join(filter(None, [
+                trigger.get_attribute("aria-controls") or "",
+                trigger.get_attribute("aria-owns") or "",
+            ])).strip()
+        except Exception:
+            raw_controls = ""
+        controlled_ids = [item.lstrip("#") for item in re.split(r"\s+", raw_controls) if item.strip()]
+        for controlled_id in controlled_ids:
+            scoped_selectors.extend([
+                f"#{controlled_id} [role='option']",
+                f"#{controlled_id} .ms-Dropdown-item",
+                f"#{controlled_id} li[role='option']",
+                f"#{controlled_id} li",
+                f"#{controlled_id} button",
+            ])
+
+    option_selectors = scoped_selectors + [
+        "[role='listbox'] [role='option']",
+        "[role='listbox'] li[role='option']",
+        ".ms-Layer [role='option']",
+        ".ms-Layer .ms-Dropdown-item",
+        ".ms-Layer li[role='option']",
+        ".ms-Layer li",
+        ".ms-ComboBox-optionsContainer [role='option']",
+        ".ms-ComboBox-optionsContainer li",
+    ]
+
     try:
         options = _collect_visible_texts(page, option_selectors, limit_per_selector=180)
     finally:
@@ -994,17 +2066,34 @@ def _extract_equipe_options(page: Page, selectors_cfg: Dict[str, Any]) -> list[s
             page.wait_for_timeout(300)
         except Exception:
             pass
+
+    visible_times = {value.casefold() for value in _extract_time_options(page)}
+    visible_reservations = {value.casefold() for value in _extract_reservation_options(page)}
+
     filtered = [
         value
         for value in options
         if "membro da equipe" not in value.casefold()
         and "selecionar equipe" not in value.casefold()
+        and not _is_invalid_equipe_value(value)
+        and value.casefold() not in visible_times
+        and value.casefold() not in visible_reservations
+        and not _is_time_option_text(value)
+        and not _is_reservation_option_text(value)
+        and any(char.isalpha() for char in value)
     ]
-    return _dedupe_option_values(filtered)
+    filtered = _dedupe_option_values(filtered)
+    if filtered:
+        return filtered
+    fallback = _extract_custom_field_options(page, "equipe", selectors_cfg)
+    if fallback:
+        return fallback
+    return _extract_equipe_options_from_page_blocks(page, trigger=trigger)
 
 
-def import_field_options_from_bookings(selectors_cfg: Dict[str, Any]) -> Dict[str, list[str]]:
-    imported: Dict[str, list[str]] = {}
+def import_field_options_from_bookings(selectors_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    imported: Dict[str, Any] = {}
+    imported_meta: Dict[str, Any] = {}
     with sync_playwright() as p:
         context = new_authenticated_context(p, headless=False)
         try:
@@ -1018,22 +2107,111 @@ def import_field_options_from_bookings(selectors_cfg: Dict[str, Any]) -> Dict[st
                 imported["escolha_reserva"] = reserva_options
                 log(f"Opções importadas para escolha_reserva: {reserva_options}")
 
-            selected_reserva = reserva_options[0] if reserva_options else ""
+            horario_por_reserva: Dict[str, list[str]] = {}
+            horario_union: list[str] = []
+            form_context_ready = False
+
+            scan_reservas = list(reserva_options or [""])
+            for reserva_name in scan_reservas:
+                log(f"Lendo horários da reserva: {reserva_name or 'padrão'}")
+                open_bookings_page(page)
+                try_close_popups(page, selectors_cfg)
+                page.wait_for_timeout(1200)
+
+                if reserva_name:
+                    clicked = _select_reference_service(page, reserva_name)
+                    if not clicked:
+                        warn(f"NÃ£o foi possÃ­vel selecionar a reserva '{reserva_name}' para leitura dos horÃ¡rios.")
+                        continue
+                    log(f"Reserva de referÃªncia selecionada para leitura dos campos: {reserva_name}")
+                    page.wait_for_timeout(1800)
+                    try_close_popups(page, selectors_cfg)
+
+                selected_date_for_service = _select_reference_date_with_retry(page)
+                if selected_date_for_service:
+                    log(f"Data de referÃªncia selecionada para leitura dos horÃ¡rios{f' da reserva {reserva_name}' if reserva_name else ''}: {selected_date_for_service}")
+                    page.wait_for_timeout(1200)
+
+                horario_options_for_service = _extract_time_options_with_retry(page)
+                if not horario_options_for_service:
+                    warn(f"Nenhum horÃ¡rio foi identificado para a reserva '{reserva_name or 'padrÃ£o'}'.")
+                    continue
+
+                horario_union = _merge_horario_options(horario_union, horario_options_for_service)
+                if reserva_name:
+                    horario_por_reserva[reserva_name] = horario_options_for_service
+                log(f"OpÃ§Ãµes importadas para horario{f' ({reserva_name})' if reserva_name else ''}: {horario_options_for_service}")
+
+                if not form_context_ready and _select_reference_time(page, horario_options_for_service[0]):
+                    log(f"HorÃ¡rio de referÃªncia selecionado para leitura do formulÃ¡rio: {horario_options_for_service[0]}")
+                    page.wait_for_timeout(1800)
+                    try_close_popups(page, selectors_cfg)
+                    form_context_ready = _wait_for_booking_details_form(page)
+                    if not form_context_ready:
+                        warn(f"O formulário adicional não apareceu após selecionar o horário da reserva '{reserva_name}'.")
+
+            if horario_union:
+                imported["horario"] = horario_union
+            if horario_por_reserva:
+                imported_meta["horario_por_reserva"] = horario_por_reserva
+
+            if not form_context_ready and reserva_options:
+                open_bookings_page(page)
+                try_close_popups(page, selectors_cfg)
+                page.wait_for_timeout(1200)
+                if _select_reference_service(page, reserva_options[0]):
+                    page.wait_for_timeout(1800)
+                    selected_date_for_service = _select_reference_date_with_retry(page)
+                    if selected_date_for_service:
+                        page.wait_for_timeout(1200)
+                        horario_options_for_service = _extract_time_options_with_retry(page)
+                        if horario_options_for_service and _select_reference_time(page, horario_options_for_service[0]):
+                            page.wait_for_timeout(1800)
+                            try_close_popups(page, selectors_cfg)
+                            form_context_ready = _wait_for_booking_details_form(page)
+
+            if not form_context_ready:
+                warn("O formulário adicional não foi carregado completamente. A importação foi limitada aos campos já confirmados.")
+                if imported_meta:
+                    imported["__meta__"] = imported_meta
+                return imported
+
+            selected_reserva = ""
             if selected_reserva:
-                clicked = _click_first_matching_visible_option(page, selected_reserva, ["li", "button", "label", "span", "div"])
+                clicked = _select_reference_service(page, selected_reserva)
                 if clicked:
                     log(f"Reserva de referência selecionada para leitura dos campos: {selected_reserva}")
                     page.wait_for_timeout(2000)
                     try_close_popups(page, selectors_cfg)
 
+            selected_date = None
+            if selected_date:
+                log(f"Data de referência selecionada para leitura dos horários: {selected_date}")
+                page.wait_for_timeout(1200)
+
+            horario_options = []
+            if horario_options:
+                imported["horario"] = horario_options
+                log(f"Opções importadas para horario: {horario_options}")
+                if _select_reference_time(page, horario_options[0]):
+                    log(f"Horário de referência selecionado para leitura do formulário: {horario_options[0]}")
+                    page.wait_for_timeout(1800)
+                    try_close_popups(page, selectors_cfg)
+
             equipe_options = []
             try:
-                equipe_options = _extract_equipe_options(page, selectors_cfg)
+                equipe_options = get_select_options(page, "EQUIPE", selectors_cfg)
+                if not equipe_options:
+                    equipe_options = _extract_equipe_options(page, selectors_cfg)
             except Exception as exc:
                 warn(f"Não foi possível importar as opções de equipe automaticamente: {exc}")
             if equipe_options:
                 imported["equipe"] = equipe_options
+                preview = ", ".join(equipe_options[:12])
                 log(f"Opções importadas para equipe: {len(equipe_options)} itens")
+                log(f"Prévia da equipe importada: {preview}")
+            else:
+                warn("Nenhuma opção de equipe foi identificada na leitura automática.")
 
             select_field_labels = [
                 ("COMPONENTE", "componente"),
@@ -1043,15 +2221,14 @@ def import_field_options_from_bookings(selectors_cfg: Dict[str, Any]) -> Dict[st
                 ("TIPO DE ATIVIDADE", "tipo_atividade"),
             ]
             for label_keyword, field_key in select_field_labels:
-                values = get_select_options(page, label_keyword)
+                try:
+                    values = get_select_options(page, label_keyword, selectors_cfg)
+                except Exception as exc:
+                    warn(f"Não foi possível importar o campo {field_key} automaticamente: {exc}")
+                    continue
                 if values:
                     imported[field_key] = values
                     log(f"Opções importadas para {field_key}: {len(values)} itens")
-
-            horario_options = _extract_time_options(page)
-            if horario_options:
-                imported["horario"] = horario_options
-                log(f"Opções importadas para horario: {horario_options}")
 
             try:
                 context.storage_state(path=str(STORAGE_STATE_PATH))
@@ -1070,6 +2247,8 @@ def import_field_options_from_bookings(selectors_cfg: Dict[str, Any]) -> Dict[st
                     pass
 
     imported = {field: _dedupe_option_values(values) for field, values in imported.items() if values}
+    if imported_meta:
+        imported["__meta__"] = imported_meta
     if not imported:
         raise RuntimeError(
             "NÃ£o foi possÃ­vel ler os campos do Bookings automaticamente. Verifique se o link da unidade estÃ¡ correto e se o usuÃ¡rio estÃ¡ logado."
@@ -1077,7 +2256,175 @@ def import_field_options_from_bookings(selectors_cfg: Dict[str, Any]) -> Dict[st
     return imported
 
 
-def get_select_options(page: Page, label_keyword: str) -> list[str]:
+def import_field_options_from_bookings(selectors_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    imported: Dict[str, Any] = {}
+    imported_meta: Dict[str, Any] = {}
+
+    with sync_playwright() as p:
+        context = new_authenticated_context(p, headless=False)
+        try:
+            page = context.new_page()
+            open_bookings_page(page)
+            try_close_popups(page, selectors_cfg)
+            page.wait_for_timeout(1800)
+
+            reserva_options = _extract_reservation_options(page)
+            if reserva_options:
+                imported["escolha_reserva"] = reserva_options
+                log(f"Opções importadas para escolha_reserva: {reserva_options}")
+
+            horario_por_reserva: Dict[str, list[str]] = {}
+            horario_union: list[str] = []
+
+            for reserva_name in list(reserva_options or [""]):
+                log(f"Lendo horários da reserva: {reserva_name or 'padrão'}")
+                open_bookings_page(page)
+                try_close_popups(page, selectors_cfg)
+                page.wait_for_timeout(1200)
+
+                if reserva_name:
+                    if not _select_reference_service(page, reserva_name):
+                        warn(f"Não foi possível selecionar a reserva '{reserva_name}' para leitura dos horários.")
+                        continue
+                    log(f"Reserva de referência selecionada para leitura dos campos: {reserva_name}")
+                    page.wait_for_timeout(1800)
+                    try_close_popups(page, selectors_cfg)
+
+                selected_date_for_service = _select_reference_date_with_retry(page)
+                if selected_date_for_service:
+                    log(
+                        f"Data de referência selecionada para leitura dos horários"
+                        f"{f' da reserva {reserva_name}' if reserva_name else ''}: {selected_date_for_service}"
+                    )
+                    page.wait_for_timeout(1200)
+
+                horario_options_for_service = _extract_time_options_with_retry(page)
+                if not horario_options_for_service:
+                    warn(f"Nenhum horário foi identificado para a reserva '{reserva_name or 'padrão'}'.")
+                    continue
+
+                horario_union = _merge_horario_options(horario_union, horario_options_for_service)
+                if reserva_name:
+                    horario_por_reserva[reserva_name] = horario_options_for_service
+                log(
+                    f"Opções importadas para horario"
+                    f"{f' ({reserva_name})' if reserva_name else ''}: {horario_options_for_service}"
+                )
+
+            if horario_union:
+                imported["horario"] = horario_union
+            if horario_por_reserva:
+                imported_meta["horario_por_reserva"] = horario_por_reserva
+
+            reference_reserva = ""
+            if horario_por_reserva:
+                reference_reserva = next((name for name, values in horario_por_reserva.items() if values), "")
+            if not reference_reserva and reserva_options:
+                reference_reserva = reserva_options[0]
+
+            form_context_ready = False
+            if reference_reserva:
+                open_bookings_page(page)
+                try_close_popups(page, selectors_cfg)
+                page.wait_for_timeout(1200)
+                if _select_reference_service(page, reference_reserva):
+                    log(f"Reserva de referência definida para leitura dos campos: {reference_reserva}")
+                    page.wait_for_timeout(1800)
+                    try_close_popups(page, selectors_cfg)
+
+            equipe_options: list[str] = []
+            try:
+                equipe_options = get_select_options(page, "EQUIPE", selectors_cfg)
+                if not equipe_options:
+                    equipe_options = _extract_equipe_options(page, selectors_cfg)
+            except Exception as exc:
+                warn(f"Não foi possível importar as opções de equipe automaticamente: {exc}")
+            if equipe_options:
+                imported["equipe"] = equipe_options
+                preview = ", ".join(equipe_options[:12])
+                log(f"Opções importadas para equipe: {len(equipe_options)} itens")
+                log(f"Prévia da equipe importada: {preview}")
+            else:
+                warn("Nenhuma opção de equipe foi identificada na leitura automática.")
+
+            selected_date_for_form = _select_reference_date_with_retry(page)
+            if selected_date_for_form:
+                log(f"Data de referência selecionada para leitura do formulário: {selected_date_for_form}")
+                page.wait_for_timeout(1200)
+            else:
+                warn("Não foi possível selecionar uma data de referência para continuar a leitura do formulário.")
+
+            reference_horarios = horario_por_reserva.get(reference_reserva, []) if reference_reserva else []
+            if not reference_horarios:
+                reference_horarios = _extract_time_options_with_retry(page)
+
+            if reference_horarios and _select_reference_time(page, reference_horarios[0]):
+                log(f"Horário de referência selecionado para leitura do formulário: {reference_horarios[0]}")
+                page.wait_for_timeout(1800)
+                try_close_popups(page, selectors_cfg)
+                form_context_ready = _wait_for_booking_details_form(page)
+            else:
+                warn("Não foi possível selecionar um horário de referência para abrir o formulário adicional.")
+
+            if not form_context_ready:
+                warn("O formulário adicional não foi carregado completamente. A importação foi limitada aos campos já confirmados.")
+                if imported_meta:
+                    imported["__meta__"] = imported_meta
+                return imported
+
+            note_locator, note_descriptor = _find_text_input_by_keywords(
+                page,
+                ["nota", "notas", "observacao", "observação", "observacoes", "observações"],
+            )
+            if note_locator is not None:
+                log(f"Campo de notas identificado: {note_descriptor or 'campo de texto encontrado'}")
+            else:
+                warn("Campo de notas não identificado automaticamente nesta unidade.")
+
+            select_field_labels = [
+                ("PÚBLICO", "publico"),
+                ("TURMA", "turma"),
+                ("COMPONENTE", "componente"),
+                ("PRINCIPAL RECURSO", "principal_recurso"),
+                ("TIPO DE ATIVIDADE", "tipo_atividade"),
+            ]
+            for label_keyword, field_key in select_field_labels:
+                try:
+                    values = get_select_options(page, label_keyword, selectors_cfg)
+                except Exception as exc:
+                    warn(f"Não foi possível importar o campo {field_key} automaticamente: {exc}")
+                    continue
+                if values:
+                    imported[field_key] = values
+                    log(f"Opções importadas para {field_key}: {len(values)} itens")
+
+            try:
+                context.storage_state(path=str(STORAGE_STATE_PATH))
+            except Exception:
+                pass
+        finally:
+            if hasattr(context, "browser") and context.browser:
+                try:
+                    context.browser.close()
+                except Exception:
+                    pass
+            else:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+    imported = {field: _dedupe_option_values(values) for field, values in imported.items() if values}
+    if imported_meta:
+        imported["__meta__"] = imported_meta
+    if not imported:
+        raise RuntimeError(
+            "Não foi possível ler os campos do Bookings automaticamente. Verifique se o link da unidade está correto e se o usuário está logado."
+        )
+    return imported
+
+
+def get_select_options(page: Page, label_keyword: str, selectors_cfg: Optional[Dict[str, Any]] = None) -> list[str]:
     """Extrai opções de um select pelo label."""
     select_elements = page.locator("select")
     total_selects = select_elements.count()
@@ -1099,11 +2446,15 @@ def get_select_options(page: Page, label_keyword: str) -> list[str]:
                                 text = (opt.text_content() or "").strip()
                             except Exception:
                                 text = ""
-                            if text:
+                            normalized = _normalize_match_text(text)
+                            if text and normalized not in {"selecione uma opcao", "selecione", "selecionar"} and not text.endswith(":"):
                                 raw_values.append(text)
                         return _dedupe_option_values(raw_values)
         except:
             pass
+    field_key = _get_field_key_from_label_keyword(label_keyword)
+    if field_key and selectors_cfg is not None:
+        return _extract_custom_field_options(page, field_key, selectors_cfg)
     return []
 
 
@@ -1111,6 +2462,7 @@ def _select_valor_by_label(page: Page, label_keyword: str, valor: str, cfg: Dict
     """Função auxiliar para selecionar valor em SELECT pelo label."""
     select_elements = page.locator("select")
     total_selects = select_elements.count()
+    field_key = _get_field_key_from_label_keyword(label_keyword)
     
     def normalize(text: str) -> str:
         return text.strip().lower() if text else ""
@@ -1150,6 +2502,14 @@ def _select_valor_by_label(page: Page, label_keyword: str, valor: str, cfg: Dict
     
     if not found_select:
         log(f"  [AVISO] SELECT com label '{label_keyword}' não encontrado")
+        if field_key:
+            open_selectors = _get_or_autodetect_open_selectors(page, cfg, field_key)
+            if open_selectors:
+                log(f"  [AUTO] Usando dropdown customizado calibrado para '{field_key}'")
+                click_any(page, open_selectors)
+                page.wait_for_timeout(500)
+                choose_option_from_open_dropdown(page, valor, cfg)
+                return
         return
 
     try:
@@ -1220,6 +2580,227 @@ def _select_valor_by_label(page: Page, label_keyword: str, valor: str, cfg: Dict
         log(f"  [ERRO] Opções disponíveis: {[(t, v) for t, v in all_option_info[:15]]}")
         raise RuntimeError(f"Opção '{valor}' não encontrada no select '{label_keyword}'.")
         
+    except Exception as e:
+        log(f"  [ERRO] Ao selecionar '{valor}': {e}")
+        raise
+
+
+def get_select_options(page: Page, label_keyword: str, selectors_cfg: Optional[Dict[str, Any]] = None) -> list[str]:
+    """Extrai opções de um select pelo label."""
+    field_key = _get_field_key_from_label_keyword(label_keyword) or label_keyword.casefold()
+    select = _get_select_locator_by_label(page, label_keyword)
+    if select is not None:
+        try:
+            options = select.locator("option")
+            total_options = min(options.count(), 300)
+            raw_values: list[str] = []
+            for idx in range(total_options):
+                try:
+                    raw_values.append(options.nth(idx).text_content() or "")
+                except Exception:
+                    continue
+            filtered = _filter_imported_field_values(field_key, raw_values)
+            if filtered:
+                return filtered
+        except Exception:
+            pass
+    if field_key == "equipe" and selectors_cfg is not None:
+        fallback = _extract_custom_field_options(page, field_key, selectors_cfg)
+        return _filter_imported_field_values(field_key, fallback)
+    return []
+
+
+def _select_valor_by_label(page: Page, label_keyword: str, valor: str, cfg: Dict[str, Any]) -> None:
+    """Função auxiliar para selecionar valor em SELECT pelo label."""
+    field_key = _get_field_key_from_label_keyword(label_keyword)
+
+    def normalize(text: str) -> str:
+        return text.strip().lower() if text else ""
+
+    def option_matches(option_text: str, option_value: str, target: str) -> bool:
+        option_text_n = normalize(option_text)
+        option_value_n = normalize(option_value)
+        target_n = normalize(target)
+        if option_text_n == target_n or option_value_n == target_n:
+            return True
+        if target_n in option_text_n or option_text_n in target_n:
+            return True
+        return False
+
+    found_select = _get_select_locator_by_label(page, label_keyword)
+    if found_select is not None:
+        log(f"  [ENCONTRADO] SELECT calibrado para '{label_keyword}'")
+
+    if not found_select:
+        log(f"  [AVISO] SELECT com label '{label_keyword}' não encontrado")
+        if field_key:
+            open_selectors = _get_or_autodetect_open_selectors(page, cfg, field_key)
+            if open_selectors:
+                log(f"  [AUTO] Usando dropdown customizado calibrado para '{field_key}'")
+                click_any(page, open_selectors)
+                page.wait_for_timeout(500)
+                choose_option_from_open_dropdown(page, valor, cfg)
+                return
+        return
+
+    try:
+        found_select.wait_for(state="visible", timeout=10000)
+        page.wait_for_timeout(500)
+
+        options = found_select.locator("option").all()
+
+        log(f"  [DEBUG] Opções do SELECT '{label_keyword}':")
+        all_option_info = []
+        for i, opt in enumerate(options):
+            text = opt.text_content() or ""
+            value = opt.get_attribute("value") or ""
+            all_option_info.append((text, value))
+            if i < 10:
+                log(f"    [{i}] text='{text}' value='{value}'")
+
+        candidate_by_value = None
+        candidate_by_label = None
+        for option in options:
+            text = option.text_content() or ""
+            value = option.get_attribute("value") or ""
+            if option_matches(text, value, valor):
+                if normalize(value) == normalize(valor):
+                    candidate_by_value = value
+                    break
+                if candidate_by_label is None:
+                    candidate_by_label = text or value
+
+        if candidate_by_value:
+            log(f"  [SELEÇÃO] Tentando por valor: '{candidate_by_value}'")
+            try:
+                found_select.select_option(candidate_by_value)
+                log(f"  [SELECIONADO] '{valor}' com sucesso por valor")
+                page.wait_for_timeout(500)
+                return
+            except Exception as e:
+                log(f"  [RETRY] Falha ao selecionar por valor: {e}")
+
+        if candidate_by_label:
+            log(f"  [SELEÇÃO] Tentando por label: '{candidate_by_label}'")
+            try:
+                found_select.select_option(label=candidate_by_label)
+                log(f"  [SELECIONADO] '{valor}' com sucesso por label")
+                page.wait_for_timeout(500)
+                return
+            except Exception as e:
+                log(f"  [RETRY] Falha ao selecionar por label: {e}")
+
+        if candidate_by_value or candidate_by_label:
+            log("  [FALLBACK] Tentando abrir dropdown e selecionar manualmente")
+            try:
+                found_select.click()
+                page.wait_for_timeout(300)
+                choose_option_from_open_dropdown(page, valor, cfg)
+                return
+            except Exception as e:
+                log(f"  [RETRY] Falha no fallback: {e}")
+
+        log(f"  [ERRO] Opção '{valor}' não encontrada")
+        log(f"  [ERRO] Opções disponíveis: {[(t, v) for t, v in all_option_info[:15]]}")
+        raise RuntimeError(f"Opção '{valor}' não encontrada no select '{label_keyword}'.")
+
+    except Exception as e:
+        log(f"  [ERRO] Ao selecionar '{valor}': {e}")
+        raise
+
+
+def get_select_options(page: Page, label_keyword: str, selectors_cfg: Optional[Dict[str, Any]] = None) -> list[str]:
+    """Extrai opções de um select pelo label real da página."""
+    field_key = _get_field_key_from_label_keyword(label_keyword) or label_keyword.casefold()
+    select = _get_select_locator_by_label(page, label_keyword)
+    if select is None:
+        return []
+
+    try:
+        options = select.locator("option")
+        total_options = min(options.count(), 300)
+        raw_values: list[str] = []
+        for idx in range(total_options):
+            try:
+                raw_values.append(options.nth(idx).text_content() or "")
+            except Exception:
+                continue
+        return _filter_imported_field_values(field_key, raw_values)
+    except Exception:
+        return []
+
+
+def _select_valor_by_label(page: Page, label_keyword: str, valor: str, cfg: Dict[str, Any]) -> None:
+    """Seleciona valor em SELECT pelo label real; fallback para dropdown customizado só se necessário."""
+    field_key = _get_field_key_from_label_keyword(label_keyword)
+
+    def normalize(text: str) -> str:
+        return _normalize_match_text(text)
+
+    def option_matches(option_text: str, option_value: str, target: str) -> bool:
+        option_text_n = normalize(option_text)
+        option_value_n = normalize(option_value)
+        target_n = normalize(target)
+        if not target_n:
+            return False
+        if option_text_n == target_n or option_value_n == target_n:
+            return True
+        if target_n in option_text_n or option_text_n in target_n:
+            return True
+        if target_n in option_value_n or option_value_n in target_n:
+            return True
+        return False
+
+    found_select = _get_select_locator_by_label(page, label_keyword)
+    if found_select is not None:
+        log(f"  [ENCONTRADO] SELECT pelo label '{label_keyword}'")
+
+    if not found_select:
+        log(f"  [AVISO] SELECT com label '{label_keyword}' não encontrado")
+        if field_key:
+            open_selectors = _get_or_autodetect_open_selectors(page, cfg, field_key)
+            if open_selectors:
+                log(f"  [AUTO] Usando dropdown customizado calibrado para '{field_key}'")
+                click_any(page, open_selectors)
+                page.wait_for_timeout(500)
+                choose_option_from_open_dropdown(page, valor, cfg)
+                return
+        return
+
+    try:
+        found_select.wait_for(state="visible", timeout=10000)
+        page.wait_for_timeout(300)
+
+        options = found_select.locator("option").all()
+        all_option_info = []
+        candidate_by_value = None
+        candidate_by_label = None
+
+        for option in options:
+            text = option.text_content() or ""
+            value = option.get_attribute("value") or ""
+            all_option_info.append((text, value))
+
+            if option_matches(text, value, valor):
+                if normalize(value) == normalize(valor):
+                    candidate_by_value = value
+                    break
+                if candidate_by_label is None:
+                    candidate_by_label = text
+
+        if candidate_by_value:
+            found_select.select_option(candidate_by_value)
+            page.wait_for_timeout(500)
+            return
+
+        if candidate_by_label:
+            found_select.select_option(label=candidate_by_label)
+            page.wait_for_timeout(500)
+            return
+
+        log(f"  [ERRO] Opção '{valor}' não encontrada no select '{label_keyword}'")
+        log(f"  [ERRO] Opções disponíveis: {[(t, v) for t, v in all_option_info[:15]]}")
+        raise RuntimeError(f"Opção '{valor}' não encontrada no select '{label_keyword}'.")
     except Exception as e:
         log(f"  [ERRO] Ao selecionar '{valor}': {e}")
         raise
@@ -1309,7 +2890,12 @@ def fill_single_booking(page: Page, job: BookingJob, turma_dict: dict, data_ref:
         raise InterruptedError("Parada solicitada durante preenchimento")
     
     log("3. Preenchendo data...")
-    fill_step_data(page, data_ref, cfg)
+    try:
+        fill_step_data(page, data_ref, cfg)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Falha de DATA: a data {data_ref} não está disponível ou não pôde ser selecionada no calendário da unidade."
+        ) from exc
     
     if stop_event and stop_event.is_set():
         raise InterruptedError("Parada solicitada durante preenchimento")
@@ -1319,7 +2905,13 @@ def fill_single_booking(page: Page, job: BookingJob, turma_dict: dict, data_ref:
     original_horario = job.horario
     job.horario = horario
     try:
-        fill_step_horario(page, job, cfg)
+        fill_step_horario(page, job, cfg, data_ref)
+    except Exception as exc:
+        if "Falha de HOR" in str(exc):
+            raise
+        raise RuntimeError(
+            f"Falha de HORÁRIO: o horário '{horario}' não está disponível para a data {data_ref}."
+        ) from exc
     finally:
         job.horario = original_horario
     
@@ -1366,7 +2958,125 @@ def fill_single_booking(page: Page, job: BookingJob, turma_dict: dict, data_ref:
     click_enviar(page, cfg, envio_real=job.confirmar_envio_real)
     log("13. Aguardando envio...")
     wait_after_submit(page, cfg)
-    safe_add_result(f"Turma {turma}: Agendamento realizado com sucesso em {data_ref}", root)
+    execution_mode = "real" if job.confirmar_envio_real else "test"
+    if job.confirmar_envio_real:
+        result_message = f"RESERVA REAL | Turma {turma} | {data_ref} | Reserva realizada com sucesso"
+    else:
+        result_message = f"TESTE | Turma {turma} | {data_ref} | Teste validado com sucesso"
+    safe_add_result(result_message, root, execution_mode=execution_mode, outcome="success")
+    log(f"✓ Formulário preenchido com sucesso para turma {turma}")
+
+
+def fill_single_booking(page: Page, job: BookingJob, turma_dict: dict, data_ref: str, cfg: Dict[str, Any], root: tk.Tk, stop_event: Optional[threading.Event] = None) -> None:
+    turma = turma_dict["turma"]
+    horario = turma_dict["horario"]
+    dias_semana = turma_dict["dias_semana"]
+    log(f"Preenchendo formulário para turma {turma} em {data_ref}")
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada antes de iniciar preenchimento")
+
+    try_close_popups(page, cfg)
+
+    log("1. Verificando tipo de reserva...")
+    fill_step_escolha_reserva(page, job, cfg)
+    page.wait_for_timeout(500)
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    log("2. Verificando equipe...")
+    fill_step_equipe(page, job, cfg)
+    page.wait_for_timeout(1000)
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    log("3. Selecionando data...")
+    try:
+        fill_step_data(page, data_ref, cfg)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Falha de DATA: a data {data_ref} não está disponível ou não pôde ser selecionada no calendário da unidade."
+        ) from exc
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    log("4. Selecionando hora...")
+    original_horario = job.horario
+    job.horario = horario
+    try:
+        fill_step_horario(page, job, cfg, data_ref)
+    except Exception as exc:
+        if "Falha de HOR" in str(exc):
+            raise
+        raise RuntimeError(
+            f"Falha de HORÁRIO: o horário '{horario}' não está disponível para a data {data_ref}."
+        ) from exc
+    finally:
+        job.horario = original_horario
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    original_dias = job.dias_semana
+    job.dias_semana = dias_semana
+    try:
+        fill_step_dia_semana(page, job, cfg)
+    finally:
+        job.dias_semana = original_dias
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    log("5. Preenchendo notas...")
+    fill_step_notas(page, job, cfg)
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    log("6. Preenchendo público...")
+    fill_step_publico(page, job, cfg)
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    log("7. Preenchendo turma...")
+    fill_step_turma(page, turma, cfg)
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    log("8. Preenchendo componente...")
+    fill_step_componente(page, job, cfg)
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    log("9. Preenchendo principal recurso...")
+    fill_step_principal_recurso(page, job, cfg)
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    log("10. Preenchendo tipo de atividade...")
+    fill_step_tipo_atividade(page, job, cfg)
+
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Parada solicitada durante preenchimento")
+
+    log("11. Clicando em reservar...")
+    click_enviar(page, cfg, envio_real=job.confirmar_envio_real)
+    log("12. Aguardando processamento...")
+    wait_after_submit(page, cfg)
+
+    execution_mode = "real" if job.confirmar_envio_real else "test"
+    if job.confirmar_envio_real:
+        result_message = f"RESERVA REAL | Turma {turma} | {data_ref} | Reserva realizada com sucesso"
+    else:
+        result_message = f"TESTE | Turma {turma} | {data_ref} | Teste validado com sucesso"
+    safe_add_result(result_message, root, execution_mode=execution_mode, outcome="success")
     log(f"✓ Formulário preenchido com sucesso para turma {turma}")
 
 
@@ -1447,8 +3157,14 @@ def run_jobs(headless: bool = False, wait_for_enter: bool = True, stop_event: Op
                             log("Execução interrompida pelo usuário")
                             raise
                         except Exception as e:
-                            fail(f"Falha ao preencher agendamento da turma {turma} em {data_ref}: {e}")
-                            safe_add_result(f"Turma {turma}: Falha em {data_ref} - {e}", root)
+                            failure_type, failure_message = _describe_booking_failure(e)
+                            fail(f"Falha de {failure_type} ao preencher agendamento da turma {turma} em {data_ref}: {failure_message}")
+                            execution_mode = "real" if job.confirmar_envio_real else "test"
+                            if job.confirmar_envio_real:
+                                result_message = f"RESERVA REAL | Turma {turma} | {data_ref} | Falha de {failure_type}: {failure_message}"
+                            else:
+                                result_message = f"TESTE | Turma {turma} | {data_ref} | Falha de {failure_type}: {failure_message}"
+                            safe_add_result(result_message, root, execution_mode=execution_mode, outcome="error")
                         finally:
                             try:
                                 click_novo_agendamento(page, cfg)
@@ -1563,6 +3279,7 @@ def launch_gui() -> None:
 
     selectors_cfg = load_json(SELECTORS_PATH)
     field_options = selectors_cfg.get("field_values", {})
+    field_options_meta = selectors_cfg.get("field_values_meta", {}) if isinstance(selectors_cfg.get("field_values_meta", {}), dict) else {}
     app_settings = load_app_settings()
 
     colors = {
@@ -1626,6 +3343,8 @@ def launch_gui() -> None:
     run_test_button = None
     run_real_button = None
     bookings_url_var = StringVar(value=app_settings.get("bookings_url", DEFAULT_BOOKINGS_URL))
+    combo_widgets: Dict[str, ttk.Combobox] = {}
+    refresh_form_option_widgets = lambda: None
 
     def current_logged_user() -> str:
         return get_logged_user_display()
@@ -1908,6 +3627,7 @@ def launch_gui() -> None:
 
     def save_selectors_cfg() -> None:
         selectors_cfg["field_values"] = field_options
+        selectors_cfg["field_values_meta"] = field_options_meta
         SELECTORS_PATH.write_text(json.dumps(selectors_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         log("Configurações de campo salvas no JSON.")
 
@@ -1938,29 +3658,56 @@ def launch_gui() -> None:
                 )
                 return
 
+            imported_meta = imported.pop("__meta__", {}) if isinstance(imported.get("__meta__"), dict) else {}
+
+            managed_field_keys = [
+                "escolha_reserva",
+                "equipe",
+                "componente",
+                "publico",
+                "turma",
+                "principal_recurso",
+                "tipo_atividade",
+                "horario",
+            ]
             summary_lines: list[str] = []
-            for field_key, values in imported.items():
-                existing_values = list(field_options.get(field_key, []))
-                if field_key == "horario":
-                    new_values = _merge_horario_options(existing_values, values)
-                else:
-                    new_values = _dedupe_option_values(values)
+            for field_key in managed_field_keys:
+                field_options[field_key] = []
+            field_options_meta.clear()
+            if imported_meta:
+                field_options_meta.update(imported_meta)
 
-                if not new_values:
-                    continue
-
+            for field_key in managed_field_keys:
+                values = imported.get(field_key, [])
+                new_values = _dedupe_option_values(values)
                 field_options[field_key] = new_values
-                summary_lines.append(f"{field_key}: {len(new_values)} opções")
+                if new_values:
+                    summary_lines.append(f"{field_key}: {len(new_values)} opções")
+
+            horario_por_reserva = field_options_meta.get("horario_por_reserva", {})
+            if isinstance(horario_por_reserva, dict) and horario_por_reserva:
+                summary_lines.append("")
+                summary_lines.append("Horários por reserva:")
+                for reserva_name, horarios in horario_por_reserva.items():
+                    if horarios:
+                        summary_lines.append(f"{reserva_name}: {len(horarios)} horários")
+
+            missing_fields = [field_key for field_key in managed_field_keys if not field_options.get(field_key)]
+            if missing_fields:
+                summary_lines.append("")
+                summary_lines.append("Campos ainda não identificados nesta leitura:")
+                summary_lines.append(", ".join(missing_fields))
 
             root.after(0, save_selectors_cfg)
-            root.after(0, lambda: refresh_status_label("Feche e abra o app para aplicar os campos importados."))
+            root.after(0, refresh_form_option_widgets)
+            root.after(0, lambda: refresh_status_label("Campos importados e aplicados ao formulário."))
             root.after(
                 0,
                 lambda: messagebox.showinfo(
                     "Importação concluída",
                     "As opções foram lidas direto da tela do Bookings.\n\n"
                     + "\n".join(summary_lines or ["Nenhum campo novo foi identificado."])
-                    + "\n\nReinicie o app para aplicar as novas listas nos campos do formulário.",
+                    + "\n\nOs campos do formulário foram atualizados na tela.",
                 ),
             )
 
@@ -2190,10 +3937,26 @@ def launch_gui() -> None:
     available_turmas = field_options.get("turma") or []
     reserva_options = field_options.get("escolha_reserva") or []
     weekday_options = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"]
-    horario_options = field_options.get("horario") or []
     reserva_vars: Dict[str, BooleanVar] = {option: BooleanVar(value=(i == 0)) for i, option in enumerate(reserva_options)}
     default_weekday = ""
     default_horario = ""
+    current_gui_date = dt.date.today()
+    default_end_gui_date = current_gui_date + dt.timedelta(days=7)
+    month_options = [str(month) for month in range(1, 13)]
+    year_options = [str(year) for year in range(current_gui_date.year, 2051)]
+
+    def first_option(field_key: str) -> str:
+        options = field_options.get(field_key) or []
+        return options[0] if options else ""
+
+    def get_current_horario_options() -> list[str]:
+        selected_reserva = entries["escolha_reserva"].get().strip() if "escolha_reserva" in entries else ""
+        horario_por_reserva = field_options_meta.get("horario_por_reserva", {})
+        if isinstance(horario_por_reserva, dict) and selected_reserva:
+            options = horario_por_reserva.get(selected_reserva) or []
+            if options:
+                return list(options)
+        return list(field_options.get("horario") or [])
 
     # Reserva
     general_frame = ttk.Frame(form_frame, style="Card.TFrame", padding=14)
@@ -2207,44 +3970,149 @@ def launch_gui() -> None:
     def select_reserva(selected: str) -> None:
         for opt, var in reserva_vars.items():
             var.set(opt == selected)
-    if reserva_options:
-        for i, option in enumerate(reserva_options):
-            ttk.Checkbutton(reserva_check_frame, text=option, variable=reserva_vars[option], command=lambda opt=option: select_reserva(opt)).grid(row=0, column=i, padx=6)
-    else:
-        ttk.Label(
-            reserva_check_frame,
-            text="Faça login e clique em 'Importar campos do Bookings' para carregar as opções da unidade.",
-            style="MutedPanel.TLabel",
-            wraplength=330,
-            justify="left",
-        ).grid(row=0, column=0, sticky="w")
+        if "escolha_reserva" in entries:
+            entries["escolha_reserva"].set(selected)
+        try:
+            update_turma_details()
+        except Exception:
+            pass
 
     fields = [
         ("Equipe", "equipe", "", field_options.get("equipe") or []),
         ("Notas", "notas", "Aula recorrente criada via automação.", None),
-        ("Componente", "componente", "", field_options.get("componente") or []),
-        ("Público", "publico", "", field_options.get("publico") or []),
-        ("Principal recurso", "principal_recurso", "", field_options.get("principal_recurso") or []),
-        ("Tipo de atividade", "tipo_atividade", "", field_options.get("tipo_atividade") or []),
+        ("Componente", "componente", first_option("componente"), field_options.get("componente") or []),
+        ("Público", "publico", first_option("publico"), field_options.get("publico") or []),
+        ("Principal recurso", "principal_recurso", first_option("principal_recurso"), field_options.get("principal_recurso") or []),
+        ("Tipo de atividade", "tipo_atividade", first_option("tipo_atividade"), field_options.get("tipo_atividade") or []),
         ("Data início", "data_inicio", "", None),
         ("Data fim", "data_fim", "", None),
     ]
 
     entries: Dict[str, StringVar] = {}
+    date_combo_vars: Dict[str, Dict[str, StringVar]] = {}
+    date_combo_widgets: Dict[str, Dict[str, ttk.Combobox]] = {}
+
+    def _sync_date_selectors(field_key: str) -> None:
+        vars_map = date_combo_vars.get(field_key)
+        widgets_map = date_combo_widgets.get(field_key)
+        if not vars_map or not widgets_map:
+            return
+        try:
+            month = int(vars_map["mes"].get())
+            year = int(vars_map["ano"].get())
+        except Exception:
+            entries[field_key].set("")
+            return
+
+        max_day = calendar.monthrange(year, month)[1]
+        day_options = [str(day) for day in range(1, max_day + 1)]
+        widgets_map["dia"].configure(values=day_options)
+
+        current_day = vars_map["dia"].get()
+        if current_day not in day_options:
+            vars_map["dia"].set(day_options[-1])
+
+        entries[field_key].set(
+            f"{int(vars_map['dia'].get()):02d}/{int(vars_map['mes'].get()):02d}/{vars_map['ano'].get()}"
+        )
+
     row = 1
     for label_text, key, default, options in fields:
         label = ttk.Label(form_frame, text=label_text)
         label.grid(row=row, column=0, sticky="e", pady=6, padx=(2, 14))
-        value = StringVar(value=default)
-        if options is not None:
-            combo = ttk.Combobox(form_frame, textvariable=value, values=options, width=48, state="readonly")
-            combo.grid(row=row, column=1, sticky="ew", pady=6)
-            combo.set(default)
+
+        if key in {"data_inicio", "data_fim"}:
+            initial_date = current_gui_date if key == "data_inicio" else default_end_gui_date
+            value = StringVar(value=initial_date.strftime("%d/%m/%Y"))
+            entries[key] = value
+
+            date_frame = ttk.Frame(form_frame, style="Inline.TFrame")
+            date_frame.grid(row=row, column=1, sticky="w", pady=6)
+
+            day_var = StringVar(value=str(initial_date.day))
+            month_var = StringVar(value=str(initial_date.month))
+            year_var = StringVar(value=str(initial_date.year))
+            date_combo_vars[key] = {"dia": day_var, "mes": month_var, "ano": year_var}
+
+            ttk.Label(date_frame, text="Dia").grid(row=0, column=0, padx=(0, 6))
+            day_combo = ttk.Combobox(date_frame, textvariable=day_var, values=[str(day) for day in range(1, 32)], width=5, state="readonly")
+            day_combo.grid(row=0, column=1, padx=(0, 12))
+
+            ttk.Label(date_frame, text="Mês").grid(row=0, column=2, padx=(0, 6))
+            month_combo = ttk.Combobox(date_frame, textvariable=month_var, values=month_options, width=5, state="readonly")
+            month_combo.grid(row=0, column=3, padx=(0, 12))
+
+            ttk.Label(date_frame, text="Ano").grid(row=0, column=4, padx=(0, 6))
+            year_combo = ttk.Combobox(date_frame, textvariable=year_var, values=year_options, width=7, state="readonly")
+            year_combo.grid(row=0, column=5)
+
+            date_combo_widgets[key] = {"dia": day_combo, "mes": month_combo, "ano": year_combo}
+            for part_var in (day_var, month_var, year_var):
+                part_var.trace_add("write", lambda *args, field=key: _sync_date_selectors(field))
+            _sync_date_selectors(key)
         else:
-            entry = ttk.Entry(form_frame, textvariable=value, width=50)
-            entry.grid(row=row, column=1, sticky="ew", pady=6)
-        entries[key] = value
+            value = StringVar(value=default)
+            if options is not None:
+                combo = ttk.Combobox(form_frame, textvariable=value, values=options, width=48, state="readonly")
+                combo.grid(row=row, column=1, sticky="ew", pady=6)
+                if default:
+                    combo.set(default)
+                else:
+                    value.set("")
+                combo_widgets[key] = combo
+            else:
+                entry = ttk.Entry(form_frame, textvariable=value, width=50)
+                entry.grid(row=row, column=1, sticky="ew", pady=6)
+            entries[key] = value
         row += 1
+
+    def rebuild_reserva_options() -> None:
+        nonlocal reserva_options, reserva_vars
+        selected_value = entries["escolha_reserva"].get().strip() if "escolha_reserva" in entries else ""
+        reserva_options = field_options.get("escolha_reserva") or []
+        reserva_vars = {
+            option: BooleanVar(value=(option == selected_value if selected_value else i == 0))
+            for i, option in enumerate(reserva_options)
+        }
+
+        for widget in reserva_check_frame.winfo_children():
+            widget.destroy()
+
+        if reserva_options:
+            for i, option in enumerate(reserva_options):
+                ttk.Checkbutton(
+                    reserva_check_frame,
+                    text=option,
+                    variable=reserva_vars[option],
+                    command=lambda opt=option: select_reserva(opt),
+                ).grid(row=0, column=i, padx=6)
+        else:
+            ttk.Label(
+                reserva_check_frame,
+                text="Faça login e clique em 'Importar campos do Bookings' para carregar as opções da unidade.",
+                style="MutedPanel.TLabel",
+                wraplength=330,
+                justify="left",
+            ).grid(row=0, column=0, sticky="w")
+
+        for var in reserva_vars.values():
+            var.trace_add("write", lambda *args: refresh_reserva())
+        refresh_reserva()
+
+    def _refresh_form_option_widgets_impl() -> None:
+        for key, combo in combo_widgets.items():
+            options = field_options.get(key) or []
+            combo.configure(values=options)
+            current_value = entries[key].get().strip()
+            if current_value not in options:
+                if key == "equipe":
+                    entries[key].set("")
+                else:
+                    entries[key].set(options[0] if options else "")
+        rebuild_reserva_options()
+        rebuild_turma_checkboxes()
+
+    refresh_form_option_widgets = _refresh_form_option_widgets_impl
     entries["escolha_reserva"] = StringVar(value="")
     def refresh_reserva() -> None:
         selected = [opt for opt, var in reserva_vars.items() if var.get()]
@@ -2252,29 +4120,12 @@ def launch_gui() -> None:
             entries["escolha_reserva"].set(selected[0])
         else:
             entries["escolha_reserva"].set("")
-    for var in reserva_vars.values():
-        var.trace_add("write", lambda *args: refresh_reserva())
-
     # Turmas section
     ttk.Label(form_frame, text="Turmas", style="Section.TLabel").grid(row=row, column=0, sticky="w", pady=(12, 6))
     turmas_frame = ttk.Frame(form_frame, style="Card.TFrame", padding=12)
     turmas_frame.grid(row=row, column=1, sticky="ew", pady=(12, 6))
     selected_turmas = []
     turma_vars = {}
-    if available_turmas:
-        for i, turma in enumerate(available_turmas):
-            var = BooleanVar()
-            chk = ttk.Checkbutton(turmas_frame, text=turma, variable=var)
-            chk.grid(row=0, column=i, padx=6)
-            turma_vars[turma] = var
-    else:
-        ttk.Label(
-            turmas_frame,
-            text="As turmas serão exibidas aqui depois da leitura dos campos da página de agendamentos.",
-            style="MutedPanel.TLabel",
-            wraplength=420,
-            justify="left",
-        ).grid(row=0, column=0, sticky="w")
 
     row += 1
 
@@ -2286,6 +4137,7 @@ def launch_gui() -> None:
     def update_turma_details():
         nonlocal selected_turmas
         selected_turmas = [t for t in available_turmas if turma_vars[t].get()]
+        current_horario_options = get_current_horario_options()
         existing_values = {
             turma: {
                 "dias_semana": details["dias_semana"].get(),
@@ -2310,14 +4162,51 @@ def launch_gui() -> None:
             dias_var = StringVar(value=dias_padrao)
             ttk.Combobox(sub_frame, textvariable=dias_var, values=weekday_options, state="readonly", width=18).grid(row=0, column=2, padx=(0, 12), pady=6)
             ttk.Label(sub_frame, text="Horário:").grid(row=0, column=3, sticky="w", padx=(0, 4))
-            horario_padrao = existing_values.get(turma, {}).get("horario") or default_horario
+            existing_horario = existing_values.get(turma, {}).get("horario") or ""
+            if existing_horario in current_horario_options:
+                horario_padrao = existing_horario
+            else:
+                horario_padrao = current_horario_options[0] if current_horario_options else ""
             horario_var = StringVar(value=horario_padrao)
-            ttk.Combobox(sub_frame, textvariable=horario_var, values=horario_options, state="readonly", width=10).grid(row=0, column=4, padx=(0, 6), pady=6)
+            ttk.Combobox(
+                sub_frame,
+                textvariable=horario_var,
+                values=current_horario_options,
+                state="readonly",
+                width=10,
+            ).grid(row=0, column=4, padx=(0, 6), pady=6)
             turma_details[turma] = {"dias_semana": dias_var, "horario": horario_var}
 
-    # Bind to update
-    for var in turma_vars.values():
-        var.trace_add("write", lambda *args: update_turma_details())
+    def rebuild_turma_checkboxes() -> None:
+        nonlocal available_turmas, turma_vars, selected_turmas
+        previous_selection = set(selected_turmas)
+        available_turmas = field_options.get("turma") or []
+        turma_vars = {}
+
+        for widget in turmas_frame.winfo_children():
+            widget.destroy()
+
+        if available_turmas:
+            for i, turma in enumerate(available_turmas):
+                var = BooleanVar(value=(turma in previous_selection))
+                chk = ttk.Checkbutton(turmas_frame, text=turma, variable=var)
+                chk.grid(row=0, column=i, padx=6)
+                turma_vars[turma] = var
+        else:
+            ttk.Label(
+                turmas_frame,
+                text="As turmas serão exibidas aqui depois da leitura dos campos da página de agendamentos.",
+                style="MutedPanel.TLabel",
+                wraplength=420,
+                justify="left",
+            ).grid(row=0, column=0, sticky="w")
+
+        for var in turma_vars.values():
+            var.trace_add("write", lambda *args: update_turma_details())
+        update_turma_details()
+
+    rebuild_reserva_options()
+    rebuild_turma_checkboxes()
 
     stop_event = threading.Event()
 
@@ -2361,7 +4250,6 @@ def launch_gui() -> None:
             messagebox.showwarning("Campos não carregados", "Clique em 'Importar campos do Bookings' para ler os campos da unidade antes de continuar.")
             return
         required_fields = [
-            ("Equipe", "equipe"),
             ("Componente", "componente"),
             ("Público", "publico"),
             ("Principal recurso", "principal_recurso"),
@@ -2393,7 +4281,6 @@ def launch_gui() -> None:
             messagebox.showwarning("Campos não carregados", "Clique em 'Importar campos do Bookings' para ler os campos da unidade antes de continuar.")
             return
         required_fields = [
-            ("Equipe", "equipe"),
             ("Componente", "componente"),
             ("Público", "publico"),
             ("Principal recurso", "principal_recurso"),
@@ -2455,11 +4342,15 @@ def launch_gui() -> None:
     results_frame.rowconfigure(1, weight=1)
     results_frame.columnconfigure(0, weight=1)
     ttk.Label(results_frame, text="Resultados dos Agendamentos", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
-    results_text = tk.Text(results_frame, height=10, wrap="word", bg=colors["success_bg"], fg=colors["text"], insertbackground=colors["text"], relief="flat", highlightthickness=1, highlightbackground=colors["success_border"], padx=12, pady=12)
+    results_text = tk.Text(results_frame, height=10, wrap="word", bg="#f8fbfa", fg=colors["text"], insertbackground=colors["text"], relief="flat", highlightthickness=1, highlightbackground=colors["success_border"], padx=12, pady=12, spacing1=3, spacing3=5)
     results_scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=results_text.yview)
     results_text.configure(yscrollcommand=results_scrollbar.set)
     results_text.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
     results_scrollbar.grid(row=1, column=1, sticky="ns")
+    results_text.tag_configure("result_test_success", foreground="#3f677d", background="#f2f7fa", font=("Segoe UI Semibold", 10), lmargin1=8, lmargin2=8, rmargin=8)
+    results_text.tag_configure("result_real_success", foreground=colors["accent"], background=colors["accent_soft"], font=("Segoe UI Semibold", 10), lmargin1=8, lmargin2=8, rmargin=8)
+    results_text.tag_configure("result_test_error", foreground=colors["accent_red"], background="#fff3f5", font=("Segoe UI Semibold", 10), lmargin1=8, lmargin2=8, rmargin=8)
+    results_text.tag_configure("result_real_error", foreground=colors["accent_red"], background=colors["accent_red_soft"], font=("Segoe UI Semibold", 10), lmargin1=8, lmargin2=8, rmargin=8)
     results_text.config(state="disabled")
     results_text_widget = results_text
 
